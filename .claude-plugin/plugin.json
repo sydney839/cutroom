@@ -1,0 +1,12 @@
+{
+  "name": "cutroom",
+  "displayName": "cutroom",
+  "version": "0.1.0",
+  "description": "Video editing skill for AI agents: plan, cut, caption, animate, mix and self-review real footage with Python and FFmpeg. No editing app needed.",
+  "author": {"name": "Sydney Rüger", "url": "https://github.com/sydney839"},
+  "homepage": "https://github.com/sydney839/cutroom",
+  "repository": "https://github.com/sydney839/cutroom",
+  "documentationUrl": "https://github.com/sydney839/cutroom#readme",
+  "license": "MIT",
+  "keywords": ["video", "video-editing", "ffmpeg", "captions", "subtitles", "reels", "shorts", "vlog", "whisper", "skill"]
+}

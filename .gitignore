@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.DS_Store
+# test projects and renders
+/test-projects/
+work/
+exports/
+*.mp4
+*.mov
+*.wav
+!docs/**/*.mp4

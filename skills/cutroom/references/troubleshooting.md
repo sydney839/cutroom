@@ -1,0 +1,39 @@
+# Troubleshooting
+
+Lessons from real edits. Check here before inventing a workaround.
+
+## Picture
+
+- **Pink, magenta or washed-out skin, or very flat colors.** The clip is HDR (iPhones film HLG/BT.2020 10-bit by default) and was used without conversion. Always edit from `proxy.py` output; it tonemaps HDR to SDR BT.709. `probe.py` lists HDR clips.
+- **Clip plays sideways.** Phone metadata rotation was lost (messenger copies, some cameras). Look at the contact sheet; rotate in the proxy (`ffmpeg -vf transpose=1`) and re-run `proxy.py` for that ID with `--force` if needed.
+- **Soft or blocky picture.** Messenger copies are 576 to 720 px wide. Ask the user for originals (cable, AirDrop, cloud download "keep originals"). Don't zoom into them.
+- **Audio drifts out of sync over a long clip.** Variable frame rate (phones, screen recorders). The proxy converts to constant fps; always cut from proxies.
+- **iPhone files missing over USB on Windows.** Photos that live only in iCloud ("Optimize Storage") are invisible over the cable. Download the originals on the phone first.
+- **Black flash at a cut.** A segment ended past the end of its source. Check `in`/`out` against the duration in `inventory.csv`; `qa.py` reports black stretches.
+
+## Captions and text
+
+- **Captions on the face.** Look for `FALLBACK` in the render log. Fixes: lower `max_words` (smaller block), `caption_pos` on that clip, or a `focus`/`zoom` that leaves room above or below the head. Face detection needs a frontal face; for profile shots set `caption_pos`.
+- **Wrong words in captions.** Add `fixes` (`{"cloud": "Claude"}`) or re-transcribe with `--model medium`. Product names: `--terms`.
+- **Whisper writes text that was never said** (often the prompt text, or "thanks for watching") over music, crowd noise or silence. Transcribe without an initial prompt and with VAD (the defaults), and don't caption clips that are only music or ambience (`vol` 0 or `captions: false`).
+- **Font falls back to Arial.** Put the `.ttf`/`.otf` into `<project>/assets/fonts/` and use its family name in `style.font`.
+- **Overlay warning "overlaps captions".** Move the overlay in time or set `pos`; never stack a hook, a chip and an image card at the same moment.
+
+## Audio
+
+- **Clicks or pops at cuts.** Every segment gets a 12 ms fade; if you still hear clicks, a cut lands inside a word: use word anchors instead of seconds or nudge with `trim_in`/`trim_out`.
+- **Music too loud under speech.** Lower `vol` (0.15 to 0.2) or raise `duck.ratio`. Clips meant as ambience should have `duck: false`, otherwise they pump the music.
+- **Final too quiet or too loud.** The renderer normalizes to `loudness` (default -14 LUFS) with a true-peak limiter at -1 dB; `qa.py` reports the measured value.
+- **Words cut off at the end of a take.** The `to` word was matched in an earlier occurrence; use a longer phrase or `to_n`.
+
+## Transcription and GPU
+
+- **faster-whisper crashes silently on Windows with CUDA.** The cuBLAS/cuDNN DLLs are missing. `transcribe.py` falls back to CPU; for GPU speed install `nvidia-cublas-cu12` and `nvidia-cudnn-cu12` via pip.
+- **h264_nvenc not available.** The scripts fall back to libx264 automatically; slower but identical workflow.
+
+## Process
+
+- **Word anchor not found.** The error shows the start of the transcript. Copy the wording from `work/takes.md`, including how Whisper spelled names.
+- **A render takes long.** Normal: about 1x to 3x real time on a laptop. Run final renders in the background, one at a time. Segments are cached; after small edits only changed segments re-render.
+- **Many files, no order.** Never assign a range of IDs to a scene by assumption. Look at each file; use clothing per day, daylight and places to date undated files.
+- **Stuck in a fix loop.** After two or three rounds, stop and ask the user with concrete options.
