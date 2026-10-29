@@ -1,19 +1,24 @@
-"""Render edit.json into a finished video.
+#!/usr/bin/env python3
+"""Reference renderer: turn edit.json into a finished video.
 
     python render.py <project> [--draft] [--out name.mp4] [--package] [--no-cache]
 
 Pipeline: plan the timeline from edit.json (word-anchored cuts, pause removal, beat-length clips)
 -> render every segment to a cached, uniform intermediate (fit, zoom, punch-ins, grade, fades)
--> concat -> captions and text overlays as one ASS file (face-aware placement)
--> image overlays and blur boxes -> music with ducking under speech, sound effects
--> loudness to target -> final encode -> captions.srt, edl.csv, review stills.
+-> concat -> captions and text overlays as one ASS file -> image overlays and blur boxes
+-> music with ducking under speech, sound effects -> loudness to target -> final encode
+-> captions.srt, edl.csv, work/render/layout.json, review stills.
+
+Positions are not chosen automatically: captions and overlays go exactly where edit.json says
+(or to a fixed default per format). The render warns when text collides with other text or
+reaches into the platform UI zone; faces.py checks the result against the faces in the picture.
+This is one way to render; anything it cannot do can be done with plain FFmpeg (references/recipes.md).
 
 See references/edit-json.md for every key.
 """
 import argparse
 import hashlib
 import json
-import math
 import os
 import re
 import shutil
@@ -518,194 +523,115 @@ def silence(d, out: Path):
          "-t", f"{d:.4f}", "-c:a", "pcm_s16le", str(out)])
 
 
-# ---------------------------------------------------------------- faces and caption placement
+# ---------------------------------------------------------------- positions (explicit, from edit.json)
+#
+# The renderer does not choose where text goes. Positions come from edit.json (or a per-format default);
+# the agent decides them by looking at the frames and at faces.py, then checks the review stills.
+# The renderer only measures every text block, warns about collisions and writes work/render/layout.json.
 
-def detect_faces(seg, samples=5):
-    """Union face box (x0, y0, x1, y1) in output pixels from the rendered segment, or None."""
-    try:
-        import cv2
-    except ImportError:
-        return "nocv"
-    casc = [cv2.CascadeClassifier(cv2.data.haarcascades + n)
-            for n in ("haarcascade_frontalface_alt2.xml", "haarcascade_frontalface_default.xml")]
-    cap = cv2.VideoCapture(str(seg["vfile"]))
-    n = max(1, int(cap.get(cv2.CAP_PROP_FRAME_COUNT)))
-    boxes, tried = [], 0
-    for i in range(samples):
-        cap.set(cv2.CAP_PROP_POS_FRAMES, int((i + 0.5) / samples * n))
-        ok, fr = cap.read()
-        if not ok:
-            continue
-        tried += 1
-        h, w = fr.shape[:2]
-        f = 540 / max(w, h) * (2 if h > w else 1)
-        g = cv2.equalizeHist(cv2.cvtColor(cv2.resize(fr, None, fx=f, fy=f), cv2.COLOR_BGR2GRAY))
-        for cc in casc:
-            r = cc.detectMultiScale(g, 1.1, 5, minSize=(40, 40))
-            if len(r):
-                x, y, bw, bh = max(r, key=lambda b: b[2] * b[3])
-                boxes.append((x / f, y / f, (x + bw) / f, (y + bh) / f))
-                break
-    cap.release()
-    if not boxes or len(boxes) < max(2, 0.4 * tried):
-        return None
-    x0, y0 = min(b[0] for b in boxes), min(b[1] for b in boxes)
-    x1, y1 = max(b[2] for b in boxes), max(b[3] for b in boxes)
-    hh = y1 - y0
-    return x0, y0 - 0.25 * hh, x1, y1 + 0.2 * hh     # hair above, chin below
+DEFAULT_DUR = {"hook": 2.6, "title": 2.0, "cta": 3.0, "image": 1.8}
+DEFAULT_Y = {  # (vertical, landscape) center y as a fraction of the height
+    "caption": (0.70, 0.86), "hook": (0.22, 0.18), "chip": (0.31, 0.14), "text": (0.31, 0.14),
+    "title": (0.50, 0.50), "lower_third": (0.70, 0.80), "cta": (0.66, 0.84),
+}
 
 
 def safe_zone(plan):
-    """(top, bottom) y range free of platform UI."""
+    """(top, bottom) y range free of platform UI (buttons, captions, progress bar)."""
     if plan.vertical:
         return int(plan.H * 0.14), int(plan.H * 0.78)
     return int(plan.H * 0.06), int(plan.H * 0.93)
 
 
 def text_sizes(plan):
-    """Font sizes and box paddings in pixels, shared by the ASS styles and the layout."""
+    """Font sizes and box paddings in pixels, shared by the ASS styles and the block measurements."""
     H, v = plan.H, plan.vertical
-    return {"hook": int(H * (0.036 if v else 0.065)), "hook_pad": int(H * (0.011 if v else 0.014)),
-            "box": int(H * (0.028 if v else 0.045)), "box_pad": int(H * (0.009 if v else 0.012)),
+    return {"hook": int(H * (0.042 if v else 0.07)), "hook_pad": int(H * 0.012),
+            "box": int(H * (0.028 if v else 0.045)), "box_pad": int(H * 0.009),
             "title": int(H * (0.075 if v else 0.11)), "sub": int(H * (0.03 if v else 0.045)),
             "handle": int(H * 0.022)}
 
 
-class Layout:
-    """Free-space bookkeeping on the frame over time: faces per segment plus placed text and image blocks.
-    Overlays are placed first (they are deliberate design choices), captions then avoid faces and overlays."""
-
-    def __init__(self, plan):
-        self.plan = plan
-        self.top, self.bottom = safe_zone(plan)
-        self.gap = int(plan.H * 0.012)
-        self.blocks = []
-
-    def faces(self, t0, t1):
-        return [s["face"] for s in self.plan.segments if isinstance(s.get("face"), tuple)
-                and s["t0"] < t1 and s["t0"] + s["dur"] > t0]
-
-    def free(self, t0, t1, y0, y1):
-        if y0 < self.top or y1 > self.bottom:
-            return False
-        g = self.gap
-        if any(y0 < f[3] + g and y1 > f[1] - g for f in self.faces(t0, t1)):
-            return False
-        return not any(a < t1 and b > t0 and y0 < d + g and y1 > c - g for a, b, c, d in self.blocks)
-
-    def scan(self, h, start, direction):
-        ys, y = [], start
-        while self.top + h / 2 <= y <= self.bottom - h / 2:
-            ys.append(y)
-            y += 8 * direction
-        return ys
-
-    def find(self, t0, t1, h, candidates):
-        for y in candidates:
-            if self.free(t0, t1, y - h / 2, y + h / 2):
-                return int(y)
-        return None
-
-    def add(self, t0, t1, y, h):
-        self.blocks.append((t0, t1, y - h / 2, y + h / 2))
+def px(v, total):
+    """0..1 = fraction of `total`, larger numbers are pixels."""
+    v = float(v)
+    return int(round(v * total)) if v <= 1 else int(round(v))
 
 
-def place_caption(layout, t0, t1, face, block_h, pos):
-    """Center y of a caption block, a size factor and a zone label."""
-    plan = layout.plan
-    default = int(plan.H * (0.72 if plan.vertical else 0.86))
-    if isinstance(pos, (int, float)) and not isinstance(pos, bool):
-        return int(pos if pos > 1 else pos * plan.H), 1.0, "fixed"
-    if pos == "top":
-        return int(plan.H * (0.19 if plan.vertical else 0.1)), 1.0, "top"
-    if pos == "bottom":
-        return layout.bottom - block_h // 2, 1.0, "bottom"
-    if pos == "center":
-        return plan.H // 2, 1.0, "center"
-    for scale in (1.0, 0.8, 0.65):
-        h = block_h * scale
-        if isinstance(face, tuple):
-            g = layout.gap
-            below = layout.scan(h, face[3] + g + h / 2, 1)
-            above = layout.scan(h, face[1] - g - h / 2, -1)
-            cands = [("below face", y) for y in below] + [("above face", y) for y in above]
-        else:
-            ys = layout.scan(h, default, 1)
-            ys2 = layout.scan(h, default - 8, -1)
-            cands = [("default", y) for pair in zip(ys2, ys) for y in pair[::-1]] + \
-                    [("default", y) for y in (ys[len(ys2):] + ys2[len(ys):])]
-        for zone, y in cands:
-            if layout.free(t0, t1, y - h / 2, y + h / 2):
-                return int(y), scale, zone + ("" if scale == 1.0 else f" {int(scale * 100)}%")
-    y = int(layout.bottom - block_h * 0.65 / 2)
-    return y, 0.65, "FALLBACK (overlaps face or overlay)"
+def default_y(plan, kind):
+    return DEFAULT_Y[kind][0 if plan.vertical else 1]
 
 
-def layout_overlays(plan, overlays, layout, render_dir, log):
-    """Decide y (and image sizes) for every overlay without an explicit position; store as o['_y'], o['_h']."""
+def caption_xy(plan, pos, block_h, where):
+    """Center of a caption block. pos: "default", "top", "center", "bottom", a y value or [x, y]."""
     W, H = plan.W, plan.H
-    sz = text_sizes(plan)
-    order = {"title": 0, "lower_third": 0, "hook": 1, "image": 2, "chip": 3, "text": 3, "cta": 4}
-    for i, o in sorted(enumerate(overlays), key=lambda io: order.get(io[1].get("type"), 9)):
-        typ = o.get("type")
-        if typ in ("blur", "pixelate"):
-            continue
-        where = f"overlays[{i}] ({typ})"
-        default_dur = {"hook": 2.6, "title": 2.0, "cta": 3.0, "image": 1.8}.get(typ, 1.6)
-        t0, t1 = plan.span(o, where, default_dur)
-        o["_t"] = (t0, t1)
-        n_lines = len(str(o.get("text", "")).split("\n"))
-        if typ == "hook":
-            h = n_lines * sz["hook"] * 1.3 + 2 * sz["hook_pad"]
-        elif typ == "cta":
-            h = sz["box"] * 1.3 + (sz["handle"] * 1.3 if o.get("handle") else 0) + 2 * sz["box_pad"]
-        elif typ == "image":
-            f = plan.project / o.get("file", "")
-            if not f.exists():
-                raise CutroomError(f"{where}: image {f} not found. Put it in assets/ and use \"assets/<name>\".")
-            if o.get("layout", "card") == "full":
-                continue
-            pre, size = prep_image(f, render_dir / f"img_{i}.png", int(W * float(o.get("width", 0.8))),
-                                   o.get("rounded", True))
-            o["_img"] = pre
-            h = size[1] if size else H * 0.25
-        elif typ == "title":
-            h = sz["title"] * 1.3 + (sz["sub"] * 2.2 if o.get("sub") else 0)
-        elif typ == "lower_third":
-            h = sz["box"] * 1.3 + 2 * sz["box_pad"] + (sz["sub"] * 1.6 if o.get("sub") else 0)
-        elif typ == "chip" or o.get("box"):
-            h = n_lines * sz["box"] * 1.3 + 2 * sz["box_pad"]
-        else:
-            h = n_lines * sz["sub"] * 1.3
-        o["_h"] = h
-        pos = o.get("pos")
-        y = None
-        if isinstance(pos, list):
-            y = pos[1] * H if pos[1] <= 1 else pos[1]
-        elif o.get("y") is not None:
-            y = o["y"] * H if o["y"] <= 1 else o["y"]
-        elif typ == "title":
-            y = H / 2
-        elif typ == "lower_third":
-            y = H * (0.70 if plan.vertical else 0.80)
-        elif typ == "image" and pos in ("center", "bottom"):
-            y = layout.find(t0, t1, h, layout.scan(h, H / 2 if pos == "center" else layout.bottom - h / 2, -1))
-        else:
-            start, direction = (layout.bottom - h / 2, -1) if typ == "cta" else (layout.top + h / 2, 1)
-            y = layout.find(t0, t1, h, layout.scan(h, start, direction))
-            if y is None:
-                y = layout.top + h / 2 if typ != "cta" else layout.bottom - h / 2
-                log.append(f"WARNING: {where} at {fmt_tc(t0)}: no free space beside the face; it covers the face "
-                           f"or other text. Shorten it, move it in time or set \"pos\".")
-        o["_y"] = int(y)
-        layout.add(t0, t1, o["_y"], h)
+    if isinstance(pos, list) and len(pos) == 2:
+        return px(pos[0], W), px(pos[1], H)
+    if isinstance(pos, (int, float)) and not isinstance(pos, bool):
+        return W // 2, px(pos, H)
+    if pos in (None, "default", "auto"):
+        return W // 2, int(H * default_y(plan, "caption"))
+    if pos == "top":
+        return W // 2, int(H * (0.19 if plan.vertical else 0.10))
+    if pos == "center":
+        return W // 2, H // 2
+    if pos == "bottom":
+        return W // 2, int(safe_zone(plan)[1] - block_h / 2)
+    raise CutroomError(f'{where}: caption position must be "default", "top", "center", "bottom", '
+                       f'a y value (0..1 or px) or [x, y], got {pos!r}')
+
+
+def overlay_xy(plan, o, kind):
+    """Anchor point of a text overlay: "pos": [x, y], or "x"/"y", else the default for its type."""
+    pos = o.get("pos")
+    if isinstance(pos, list) and len(pos) == 2:
+        return px(pos[0], plan.W), px(pos[1], plan.H)
+    x_default = 0.06 if kind == "lower_third" else 0.5
+    return px(o.get("x", x_default), plan.W), px(o.get("y", default_y(plan, kind)), plan.H)
+
+
+def text_width(lines, size):
+    return max((len(line) for line in lines), default=1) * size * 0.6
+
+
+def block(what, kind, t0, t1, cx, cy, w, h, left=False):
+    x0 = cx if left else cx - w / 2
+    return {"what": what, "kind": kind, "t0": round(t0, 3), "t1": round(t1, 3),
+            "box": [int(x0), int(cy - h / 2), int(x0 + w), int(cy + h / 2)]}
+
+
+def overlaps(a, b):
+    return (a["t0"] < b["t1"] and b["t0"] < a["t1"] and a["box"][0] < b["box"][2] and b["box"][0] < a["box"][2]
+            and a["box"][1] < b["box"][3] and b["box"][1] < a["box"][3])
+
+
+def check_blocks(plan, blocks, log):
+    """Warn about text that collides with other text or sits in the platform UI zone. It does not move anything."""
+    top, bottom = safe_zone(plan)
+    caps = [b for b in blocks if b["kind"] == "caption"]
+    ovs = [b for b in blocks if b["kind"] != "caption"]
+    for i, o in enumerate(ovs):
+        c = next((c for c in caps if overlaps(o, c)), None)
+        if c:
+            log.append(f"WARNING: {o['what']} at {fmt_tc(max(o['t0'], c['t0']))} covers the captions "
+                       f"(caption y {c['box'][1]}-{c['box'][3]} px). Move it (\"pos\") or the captions "
+                       f"(\"caption_pos\"), or shift it in time")
+        for o2 in ovs[i + 1:]:
+            if overlaps(o, o2):
+                log.append(f"WARNING: {o['what']} and {o2['what']} overlap at {fmt_tc(max(o['t0'], o2['t0']))}")
+        if plan.vertical and o["kind"] == "overlay" and (o["box"][1] < top or o["box"][3] > bottom):
+            log.append(f"WARNING: {o['what']} reaches into the platform UI zone (keep it between y {top} and {bottom} px)")
+    out = [c for c in caps if c["box"][1] < top or c["box"][3] > bottom]
+    if plan.vertical and out:
+        log.append(f"WARNING: {len(out)} caption chunk(s) reach into the platform UI zone, first at "
+                   f"{fmt_tc(out[0]['t0'])} (keep them between y {top} and {bottom} px)")
 
 
 # ---------------------------------------------------------------- captions and text overlays (ASS)
 
 STYLE_PRESETS = {
     "bold": {"size": 0.050, "upper": True, "max_words": 3, "outline": 0.0045, "pop": True, "highlight": True},
-    "clean": {"size": 0.036, "upper": False, "max_words": 7, "outline": 0.0, "pop": False, "highlight": False,
+    "clean": {"size": 0.042, "upper": False, "max_words": 7, "outline": 0.0, "pop": False, "highlight": False,
               "box": True},
     "karaoke": {"size": 0.044, "upper": False, "max_words": 5, "outline": 0.004, "pop": False, "highlight": True},
 }
@@ -737,7 +663,7 @@ def caption_words(plan, cap):
 
 def chunk_words(words, max_words):
     chunks, cur = [], []
-    for i, w in enumerate(words):
+    for w in words:
         if cur and (len(cur) >= max_words or w["seg"] is not cur[-1]["seg"] or w["t0"] - cur[-1]["t1"] > 0.45
                     or re.search(r"[.!?:;,]$", cur[-1]["text"])):
             chunks.append(cur)
@@ -768,8 +694,10 @@ def wrap_lines(words, max_chars):
 
 
 def build_ass(plan, overlays_text, fontname, accent, log):
+    """ASS file text, SRT entries and the measured text blocks (for collision warnings and layout.json)."""
     W, H = plan.W, plan.H
     e = plan.edit
+    sz = text_sizes(plan)
     cap = {"style": "bold" if plan.vertical else "clean", **(e.get("captions") or {})}
     enabled = cap.get("enabled", True) and cap.get("style") != "none"
     st = {**STYLE_PRESETS.get(cap["style"], STYLE_PRESETS["bold"]), **cap}
@@ -789,19 +717,17 @@ def build_ass(plan, overlays_text, fontname, accent, log):
         f"{outline},{max(1, outline // 3)},5,20,20,20,1",
         f"Style: CapBox,{fontname},{size},{white},{white},{boxc},{boxc},-1,0,0,0,100,100,0,0,3,"
         f"{int(size * 0.28)},0,5,20,20,20,1",
-        f"Style: Hook,{fontname},{int(H * 0.042 if plan.vertical else H * 0.07)},{white},{white},"
-        f"{ass_color('#000000', 0x20)},{ass_color('#000000', 0x20)},-1,0,0,0,100,100,0,0,3,{int(H * 0.012)},0,5,30,30,30,1",
-        f"Style: Box,{fontname},{int(H * 0.028 if plan.vertical else H * 0.045)},{white},{white},"
-        f"{ass_color('#111111', 0x10)},{ass_color('#111111', 0x10)},-1,0,0,0,100,100,0,0,3,{int(H * 0.009)},0,5,30,30,30,1",
-        f"Style: Title,{fontname},{int(H * 0.075 if plan.vertical else H * 0.11)},{white},{white},{black},"
+        f"Style: Hook,{fontname},{sz['hook']},{white},{white},"
+        f"{ass_color('#000000', 0x20)},{ass_color('#000000', 0x20)},-1,0,0,0,100,100,0,0,3,{sz['hook_pad']},0,5,30,30,30,1",
+        f"Style: Box,{fontname},{sz['box']},{white},{white},"
+        f"{ass_color('#111111', 0x10)},{ass_color('#111111', 0x10)},-1,0,0,0,100,100,0,0,3,{sz['box_pad']},0,5,30,30,30,1",
+        f"Style: Title,{fontname},{sz['title']},{white},{white},{black},"
         f"{ass_color('#000000', 0x80)},-1,0,0,0,100,100,2,0,1,{max(2, int(H * 0.002))},{max(2, int(H * 0.003))},5,30,30,30,1",
-        f"Style: Sub,{fontname},{int(H * 0.03 if plan.vertical else H * 0.045)},{white},{white},{black},"
+        f"Style: Sub,{fontname},{sz['sub']},{white},{white},{black},"
         f"{ass_color('#000000', 0x80)},0,0,0,0,100,100,1,0,1,{max(1, int(H * 0.0015))},1,5,30,30,30,1",
         "", "[Events]", "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
     ]
-    ev = []
-    srt = []
-    caption_spans = []
+    ev, srt, blocks = [], [], []
 
     def dlg(layer, t0, t1, style, text):
         ev.append(f"Dialogue: {layer},{ass_time(t0)},{ass_time(t1)},{style},,0,0,0,,{text}")
@@ -813,34 +739,29 @@ def build_ass(plan, overlays_text, fontname, accent, log):
         chunks = chunk_words(words, int(st["max_words"]))
         emph = [norm(x) for x in cap.get("emphasis", [])]
         max_chars = int((W * 0.86) / (size * 0.56))
-        face_cache = {}
         for ch in chunks:
             seg = ch[0]["seg"]
-            if id(seg) not in face_cache:
-                pos = seg["spec"].get("caption_pos", cap.get("position", "auto"))
-                face = detect_faces(seg) if pos == "auto" else None
-                if face == "nocv" and not log.count("nocv"):
-                    log.append("nocv")
-                face_cache[id(seg)] = (face, pos)
-            face, pos = face_cache[id(seg)]
+            pos = seg["spec"].get("caption_pos", cap.get("position", "default"))
+            boxed = bool(st.get("box")) or pos == "top"
             toks = [w["text"].upper() if st.get("upper") else w["text"] for w in ch]
             lines = wrap_lines(toks, max_chars)
-            block_h = int(len(lines) * size * 1.15 + outline * 2)
-            y, scale, zone = place_caption(plan, face if face != "nocv" else None, block_h, pos)
-            seg.setdefault("zones", set()).add(zone)
-            style = "CapBox" if (st.get("box") or pos == "top") else "Cap"
+            pad = int(size * 0.28) if boxed else outline
+            block_h = int(len(lines) * size * 1.15 + 2 * pad)
+            x, y = caption_xy(plan, pos, block_h, f"clips[{seg['clip']}] caption_pos")
+            seg.setdefault("cap_y", set()).add(y)
+            style = "CapBox" if boxed else "Cap"
             t_start, t_end = ch[0]["t0"], ch[-1]["chunk_end"]
-            caption_spans.append((t_start, t_end, y, block_h * scale))
+            blocks.append(block(f"captions \"{' '.join(toks)[:30]}\"", "caption", t_start, t_end, x, y,
+                                text_width([" ".join(li) for li in lines], size) + 2 * pad, block_h))
             srt.append((t_start, t_end, " ".join(w["text"] for w in ch)))
-            fs = f"\\fscx{int(scale * 100)}\\fscy{int(scale * 100)}" if scale != 1.0 else ""
-            base = f"{{\\an5\\pos({W // 2},{y}){fs}}}"
-            pop = (f"{{\\fscx{int(scale * 82)}\\fscy{int(scale * 82)}\\t(0,90,\\fscx{int(scale * 106)}\\fscy{int(scale * 106)})"
-                   f"\\t(90,170,\\fscx{int(scale * 100)}\\fscy{int(scale * 100)})}}") if st.get("pop") else ""
+            base = f"{{\\an5\\pos({x},{y})}}"
+            pop = ("{\\fscx82\\fscy82\\t(0,90,\\fscx106\\fscy106)\\t(90,170,\\fscx100\\fscy100)}"
+                   if st.get("pop") else "")
             fade = "{\\fad(80,60)}" if not st.get("pop") else ""
 
             def render_line(active):
                 parts, k = [], 0
-                for li, line in enumerate(lines):
+                for line in lines:
                     out = []
                     for tok in line:
                         hot = (k == active and st.get("highlight")) or any(x and x in norm(tok) for x in emph)
@@ -860,62 +781,70 @@ def build_ass(plan, overlays_text, fontname, accent, log):
             else:
                 dlg(1, t_start, t_end, style, base + pop + fade + render_line(0 if st.get("highlight") else -1))
 
-    # text overlays
-    top, bottom = safe_zone(plan)
+    # text overlays: position from "pos"/"x"/"y" or the type's default, nothing is moved automatically
     for i, o in overlays_text:
-        where = f"overlays[{i}] ({o['type']})"
-        default_dur = {"hook": 2.6, "title": 2.0, "cta": 3.0}.get(o["type"], 1.6)
-        t0, t1 = plan.span(o, where, default_dur)
-        x, y = o.get("pos") if isinstance(o.get("pos"), list) else (None, None)
-        x = int(x * W) if x is not None and x <= 1 else (x or W // 2)
+        typ = o["type"]
+        where = f"overlays[{i}] ({typ})"
+        t0, t1 = plan.span(o, where, DEFAULT_DUR.get(typ, 1.6))
+        x, y = overlay_xy(plan, o, typ)
         anim = o.get("anim", {"hook": "pop", "chip": "pop", "title": "rise", "lower_third": "slide",
-                              "cta": "pop", "text": "fade"}.get(o["type"], "fade"))
-        text = ass_escape(str(o.get("text", "")))
-        if o["type"] == "hook":
-            yy = y or int(H * (0.22 if plan.vertical else 0.18))
-            lines = str(o.get("text", "")).split("\n")
-            first = ass_escape(lines[0])
-            body = first
+                              "cta": "pop", "text": "fade"}.get(typ, "fade"))
+        raw = str(o.get("text", ""))
+        lines = raw.split("\n")
+        text = ass_escape(raw)
+        if typ == "hook":
+            body = ass_escape(lines[0])
             if len(lines) > 1:
                 body += f"\\N{{\\3c{acc}\\4c{acc}\\c{ass_color('#111111')}}}" + ass_escape(" ".join(lines[1:]))
-            dlg(5, t0, t1, "Hook", f"{{\\an5\\pos({x},{int(yy * H if yy <= 1 else yy)})}}{anim_tags(anim, x, yy if yy > 1 else int(yy * H), W, H)}{body}")
-            check_overlap(log, where, t0, t1, int(yy if yy > 1 else yy * H), caption_spans)
-        elif o["type"] in ("chip", "text"):
-            yy = y if y is not None else (o.get("y") or (H * (0.31 if plan.vertical else 0.14)))
-            yy = int(yy * H if yy <= 1 else yy)
-            style = "Box" if o["type"] == "chip" or o.get("box", False) else "Sub"
+            dlg(5, t0, t1, "Hook", f"{{\\an5\\pos({x},{y})}}{anim_tags(anim, x, y, W, H)}{body}")
+            h = len(lines[:2]) * sz["hook"] * 1.25 + 2 * sz["hook_pad"]
+            blocks.append(block(where, "overlay", t0, t1, x, y, text_width(lines, sz["hook"]) + 2 * sz["hook_pad"], h))
+        elif typ in ("chip", "text"):
+            boxed = typ == "chip" or o.get("box", False)
+            style, fs = ("Box", sz["box"]) if boxed else ("Sub", sz["sub"])
             color = f"{{\\3c{ass_color(o['box_color'])}\\4c{ass_color(o['box_color'])}}}" if o.get("box_color") else ""
             if anim == "typewriter":
-                raw = str(o.get("text", ""))
                 step = min(0.05, (t1 - t0) * 0.5 / max(1, len(raw)))
                 for k in range(1, len(raw) + 1):
                     a = t0 + (k - 1) * step
                     b = t0 + k * step if k < len(raw) else t1
-                    dlg(5, a, b, style, f"{{\\an5\\pos({x},{yy})}}{color}{ass_escape(raw[:k])}")
+                    dlg(5, a, b, style, f"{{\\an5\\pos({x},{y})}}{color}{ass_escape(raw[:k])}")
             else:
-                dlg(5, t0, t1, style, f"{{\\an5\\pos({x},{yy})}}{color}{anim_tags(anim, x, yy, W, H)}{text}")
-            check_overlap(log, where, t0, t1, yy, caption_spans)
-        elif o["type"] == "title":
-            yy = int((y or 0.5) * H) if (y or 0.5) <= 1 else int(y)
+                dlg(5, t0, t1, style, f"{{\\an5\\pos({x},{y})}}{color}{anim_tags(anim, x, y, W, H)}{text}")
+            pad = sz["box_pad"] if boxed else 0
+            blocks.append(block(where, "overlay", t0, t1, x, y, text_width(lines, fs) + 2 * pad,
+                                len(lines) * fs * 1.25 + 2 * pad))
+        elif typ == "title":
             sub = o.get("sub")
             dy = int(H * (0.05 if plan.vertical else 0.08))
-            dlg(6, t0, t1, "Title", f"{{\\an5\\pos({x},{yy - (dy // 2 if sub else 0)})}}{anim_tags(anim, x, yy, W, H)}{text}")
+            ty = y - (dy // 2 if sub else 0)
+            dlg(6, t0, t1, "Title", f"{{\\an5\\pos({x},{ty})}}{anim_tags(anim, x, ty, W, H)}{text}")
             if sub:
-                dlg(6, t0 + 0.12, t1, "Sub", f"{{\\an5\\pos({x},{yy + dy})\\fad(250,200)}}{ass_escape(str(sub))}")
-        elif o["type"] == "lower_third":
-            xx = int(W * 0.06)
-            yy = int(H * (0.70 if plan.vertical else 0.80))
-            dlg(5, t0, t1, "Box", f"{{\\an4\\move({xx - 60},{yy},{xx},{yy},0,220)\\fad(150,200)}}{text}")
+                dlg(6, t0 + 0.12, t1, "Sub", f"{{\\an5\\pos({x},{y + dy})\\fad(250,200)}}{ass_escape(str(sub))}")
+            top = ty - len(lines) * sz["title"] * 0.65
+            bot = (y + dy + sz["sub"] * 0.65) if sub else ty + len(lines) * sz["title"] * 0.65
+            blocks.append(block(where, "title", t0, t1, x, (top + bot) / 2,
+                                max(text_width(lines, sz["title"]), text_width([str(sub or "")], sz["sub"])), bot - top))
+        elif typ == "lower_third":
+            dy = int(H * 0.05)
+            dlg(5, t0, t1, "Box", f"{{\\an4\\move({x - 60},{y},{x},{y},0,220)\\fad(150,200)}}{text}")
             if o.get("sub"):
-                dlg(5, t0 + 0.1, t1, "Sub", f"{{\\an4\\move({xx - 60},{yy + int(H * 0.05)},{xx},{yy + int(H * 0.05)},0,260)\\fad(200,200)}}{ass_escape(str(o['sub']))}")
-        elif o["type"] == "cta":
-            yy = int((y or (0.66 if plan.vertical else 0.84)) * H) if (y or 0.66) <= 1 else int(y)
-            label = text + (f"\\N{{\\fs{int(H * 0.022)}}}{ass_escape(o['handle'])}" if o.get("handle") else "")
-            dlg(5, t0, t1, "Box", f"{{\\an5\\pos({x},{yy})\\3c{acc}\\4c{acc}\\c{ass_color('#111111')}}}"
-                f"{anim_tags('pop', x, yy, W, H)}{label}")
+                dlg(5, t0 + 0.1, t1, "Sub", f"{{\\an4\\move({x - 60},{y + dy},{x},{y + dy},0,260)\\fad(200,200)}}"
+                    f"{ass_escape(str(o['sub']))}")
+            h = sz["box"] * 1.25 + 2 * sz["box_pad"] + (dy if o.get("sub") else 0)
+            w = max(text_width(lines, sz["box"]) + 2 * sz["box_pad"], text_width([str(o.get("sub", ""))], sz["sub"]))
+            blocks.append(block(where, "overlay", t0, t1, x, y - sz["box"] * 0.6 - sz["box_pad"] + h / 2, w, h,
+                                left=True))
+        elif typ == "cta":
+            label = text + (f"\\N{{\\fs{sz['handle']}}}{ass_escape(o['handle'])}" if o.get("handle") else "")
+            dlg(5, t0, t1, "Box", f"{{\\an5\\pos({x},{y})\\3c{acc}\\4c{acc}\\c{ass_color('#111111')}}}"
+                f"{anim_tags('pop', x, y, W, H)}{label}")
+            h = len(lines) * sz["box"] * 1.25 + (sz["handle"] * 1.25 if o.get("handle") else 0) + 2 * sz["box_pad"]
+            w = max(text_width(lines, sz["box"]), text_width([str(o.get("handle", ""))], sz["handle"]))
+            blocks.append(block(where, "overlay", t0, t1, x, y, w + 2 * sz["box_pad"], h))
         else:
             raise CutroomError(f"{where}: unknown type. Text types: hook, chip, text, title, lower_third, cta.")
-    return "\n".join(head + ev) + "\n", srt
+    return "\n".join(head + ev) + "\n", srt, blocks
 
 
 def anim_tags(anim, x, y, W, H):
@@ -928,13 +857,6 @@ def anim_tags(anim, x, y, W, H):
     if anim == "none":
         return ""
     return "{\\fad(180,180)}"
-
-
-def check_overlap(log, where, t0, t1, y, spans):
-    for a, b, cy, bh in spans:
-        if a < t1 and b > t0 and abs(cy - y) < bh / 2 + 70:
-            log.append(f"WARNING: {where} at {fmt_tc(t0)} overlaps captions (y {cy}); move it ('pos') or in time")
-            return
 
 
 # ---------------------------------------------------------------- images and blur boxes
@@ -965,9 +887,9 @@ def prep_image(src: Path, out: Path, width_px: int, rounded=True):
 
 
 def build_video_graph(plan, img_overlays, blurs, render_dir: Path, log):
-    """filter_complex fragments for blur boxes and image overlays on [0:v]; extra inputs list."""
+    """filter_complex fragments for blur boxes and image overlays on [0:v]; extra inputs; image blocks."""
     W, H = plan.W, plan.H
-    inputs, parts, cur, n = [], [], "0:v", 1
+    inputs, parts, blocks, cur, n = [], [], [], "0:v", 1
     for i, o in blurs:
         where = f"overlays[{i}] (blur)"
         t0, t1 = plan.span(o, where, plan.total)
@@ -975,7 +897,10 @@ def build_video_graph(plan, img_overlays, blurs, render_dir: Path, log):
         if max(x, y, w, h) <= 1:
             x, y, w, h = x * W, y * H, w * W, h * H
         x, y, w, h = even(x), even(y), even(w), even(h)
-        strength = int(o.get("strength", 20))
+        x, y = min(max(0, x), W - 2), min(max(0, y), H - 2)
+        w, h = max(2, min(w, W - x)) // 2 * 2, max(2, min(h, H - y)) // 2 * 2
+        # boxblur's radius must fit the chroma plane (half size in yuv420p)
+        strength = max(1, min(int(o.get("strength", 20)), min(w, h) // 4 - 1))
         mode = "pixelate" if o.get("pixelate") else "blur"
         eff = (f"scale={max(2, w // 16)}:{max(2, h // 16)},scale={w}:{h}:flags=neighbor" if mode == "pixelate"
                else f"boxblur={strength}:3")
@@ -987,7 +912,7 @@ def build_video_graph(plan, img_overlays, blurs, render_dir: Path, log):
         f = plan.project / o["file"]
         if not f.exists():
             raise CutroomError(f"{where}: image {f} not found. Put it in assets/ and use \"assets/<name>\".")
-        t0, t1 = plan.span(o, where, 1.8)
+        t0, t1 = plan.span(o, where, DEFAULT_DUR["image"])
         layout = o.get("layout", "card")
         if layout == "full":
             inputs += ["-loop", "1", "-framerate", str(plan.fps), "-t", f"{t1 - t0 + 0.1:.3f}", "-i", str(f)]
@@ -1001,12 +926,15 @@ def build_video_graph(plan, img_overlays, blurs, render_dir: Path, log):
             pre, size = prep_image(f, render_dir / f"img_{i}.png", int(W * wfrac), o.get("rounded", True))
             inputs += ["-loop", "1", "-framerate", str(plan.fps), "-t", f"{t1 - t0 + 0.1:.3f}", "-i", str(pre)]
             pos = o.get("pos", "top")
-            if isinstance(pos, list):
-                cx, cy = pos[0] * W if pos[0] <= 1 else pos[0], pos[1] * H if pos[1] <= 1 else pos[1]
-            else:
+            if isinstance(pos, list) and len(pos) == 2:
+                cx, cy = px(pos[0], W), px(pos[1], H)
+            elif pos in ("top", "center", "bottom"):
                 cx = W / 2
-                cy = {"top": H * (0.30 if plan.vertical else 0.3), "center": H / 2,
-                      "bottom": H * (0.62 if plan.vertical else 0.7)}.get(pos, H * 0.3)
+                cy = {"top": H * 0.30, "center": H / 2, "bottom": H * (0.62 if plan.vertical else 0.7)}[pos]
+                if "y" in o:
+                    cy = px(o["y"], H)
+            else:
+                raise CutroomError(f'{where}: "pos" must be "top", "center", "bottom" or [x, y], got {pos!r}')
             d = t1 - t0
             slide = int(H * 0.02)
             parts.append(f"[{n}:v]format=rgba,fade=t=in:st=0:d=0.15:alpha=1,"
@@ -1014,10 +942,10 @@ def build_video_graph(plan, img_overlays, blurs, render_dir: Path, log):
                          f"[{cur}][im{i}]overlay=x='{cx:.0f}-w/2':y='{cy:.0f}-h/2+{slide}*max(0,1-(t-{t0:.3f})/0.2)'"
                          f":eof_action=pass:enable='between(t,{t0:.3f},{t1:.3f})'[v{i}i]")
             if size:
-                log.append(f"image overlays[{i}] {o['file']}: {size[0]}x{size[1]} px at y {cy:.0f}, {fmt_tc(t0)}-{fmt_tc(t1)}")
+                blocks.append(block(f"overlays[{i}] (image)", "overlay", t0, t1, cx, cy, size[0], size[1]))
         cur = f"v{i}i"
         n += 1
-    return inputs, parts, cur
+    return inputs, parts, cur, blocks
 
 
 # ---------------------------------------------------------------- audio
@@ -1083,9 +1011,12 @@ def build_audio(plan, render_dir: Path, dialog: Path, key: Path, log):
     return mus_out, sfx_out
 
 
-def measure_loudness(path: Path):
-    p = run(["ffmpeg", "-hide_banner", "-nostats", "-i", str(path), "-af", "ebur128=peak=true", "-f", "null", "-"],
-            check=False)
+LIMIT = ",alimiter=limit=0.841:level=false"
+
+
+def measure_loudness(path: Path, pre_filter=""):
+    p = run(["ffmpeg", "-hide_banner", "-nostats", "-i", str(path), "-af", pre_filter + "ebur128=peak=true",
+             "-f", "null", "-"], check=False)
     txt = p.stderr
     i = re.findall(r"I:\s+(-?[\d.]+|-inf) LUFS", txt)
     tp = re.findall(r"Peak:\s+(-?[\d.]+|-inf) dBFS", txt)
@@ -1115,6 +1046,7 @@ def main():
     plan = Plan(project, edit, args.draft)
     render_dir = project / "work" / "render"
     render_dir.mkdir(parents=True, exist_ok=True)
+    (render_dir / "layout.json").unlink(missing_ok=True)  # written again at the end; never pair a stale one with a new base.mp4
     review = project / "work" / "review"
     exports = project / "exports"
     log = list(plan.warnings)
@@ -1167,7 +1099,7 @@ def main():
         fallback = "Arial" if os.name == "nt" or sys.platform == "darwin" else "DejaVu Sans"
         log.append(f"font '{font}' not found (put its .ttf into assets/fonts/), using {fallback}")
         font = fallback
-    ass_text, srt = build_ass(plan, txt, font, style.get("accent", "#FFD60A"), log)
+    ass_text, srt, blocks = build_ass(plan, txt, font, style.get("accent", "#FFD60A"), log)
     (render_dir / "subs.ass").write_text(ass_text, encoding="utf-8")
     if srt:
         (exports / "captions.srt").write_text(
@@ -1178,13 +1110,27 @@ def main():
     pre = render_dir / "premix.wav"
     run(["ffmpeg", "-hide_banner", "-y", "-v", "error", "-i", str(dialog), "-i", str(mus), "-i", str(sfx),
          "-filter_complex", f"[0:a][1:a][2:a]amix=inputs=3:normalize=0,atrim=0:{plan.total:.4f}[a]", "-map", "[a]",
-         "-c:a", "pcm_s16le", str(pre)])
+         "-c:a", "pcm_f32le", str(pre)])  # float: the sum may exceed full scale before the gain below
     target = float(edit.get("loudness", -14))
     li, pk = measure_loudness(pre)
     gain = max(-30.0, min(30.0, target - li)) if li > -69 else 0.0
-    limiter = pk + gain > -1.0
+    # the limiter works on sample peaks and AAC adds overshoot, so aim 0.5 dB below the -1 dBTP limit
+    limiter = pk + gain > -1.5
+    if limiter:  # limiting lowers the loudness; measure once more and make up the difference
+        li2, _ = measure_loudness(pre, f"volume={gain:.2f}dB{LIMIT},")
+        gain += max(0.0, min(3.0, target - li2)) if li2 > -69 else 0.0
 
-    inputs, parts, vlabel = build_video_graph(plan, imgs, blurs, render_dir, log)
+    inputs, parts, vlabel, img_blocks = build_video_graph(plan, imgs, blurs, render_dir, log)
+    blocks += img_blocks
+    check_blocks(plan, blocks, log)
+    top, bottom = safe_zone(plan)
+    write_json(render_dir / "layout.json", {
+        "_about": "Written by render.py: every segment and every text/image block of the last render, "
+                  "in output pixels. faces.py compares these blocks with the face boxes.",
+        "w": plan.W, "h": plan.H, "fps": plan.fps, "safe_zone": [top, bottom],
+        "segments": [{"n": k + 1, "clip": s["clip"], "t0": round(s["t0"], 3), "t1": round(s["t0"] + s["dur"], 3),
+                      "src": s["path"].name if s["path"] else "card"} for k, s in enumerate(plan.segments)],
+        "blocks": blocks})
     fontsdir = ""
     if (project / "assets" / "fonts").exists():
         # relative to the render dir (ffmpeg runs there): drive-letter colons break filter parsing
@@ -1193,7 +1139,7 @@ def main():
     out_name = args.out or f"{project.name}.mp4"
     final = exports / out_name
     a_idx = 1 + sum(1 for x in inputs if x == "-i")
-    afilter = f"[{a_idx}:a]volume={gain:.2f}dB" + (",alimiter=limit=0.891:level=false" if limiter else "") + "[aout]"
+    afilter = f"[{a_idx}:a]volume={gain:.2f}dB" + (LIMIT if limiter else "") + "[aout]"
     run(["ffmpeg", "-hide_banner", "-y", "-v", "error", "-i", str(base), *inputs, "-i", str(pre),
          "-filter_complex", vchain + ";" + afilter, "-map", "[vout]", "-map", "[aout]",
          *video_encoder(final=True, draft=args.draft), "-pix_fmt", "yuv420p", *COLOR_TAGS,
@@ -1254,24 +1200,20 @@ def main():
              "-vf", "scale=540:-2", "-q:v", "4", str(review / f"t{t:07.2f}.jpg")], check=False)
 
     # report
-    print(f"\nSegments (timeline | source in-out | caption zone):")
+    print("\nSegments (timeline | source in-out | caption y):")
     for k, s in enumerate(plan.segments):
         src = s["path"].name if s["path"] else f"card '{s['spec'].get('card', '')}'"
         rng = "" if s["a"] is None or s["kind"] != "video" else f"{s['a']:.2f}-{s['b']:.2f}"
-        zones = ", ".join(sorted(s.get("zones", []))) or "-"
-        print(f"  {k + 1:3d}  {fmt_tc(s['t0'])}-{fmt_tc(s['t0'] + s['dur'])}  clip {s['clip']:<3d} {src[:34]:<34} {rng:<13} {zones}")
+        ys = ", ".join(f"{y} px" for y in sorted(s.get("cap_y", []))) or "-"
+        print(f"  {k + 1:3d}  {fmt_tc(s['t0'])}-{fmt_tc(s['t0'] + s['dur'])}  clip {s['clip']:<3d} {src[:34]:<34} {rng:<13} {ys}")
     for line in log:
-        if line == "nocv":
-            print("WARNING: opencv not installed, captions use the default position (pip install opencv-python-headless)")
-        else:
-            print(("" if line.startswith(("WARNING", "image")) else "WARNING: ") + line)
-    fb = sum(1 for s in plan.segments if any("FALLBACK" in z for z in s.get("zones", [])))
-    if fb:
-        print(f"WARNING: {fb} segment(s) had no room for captions beside the face (FALLBACK). Check their stills.")
+        print(("" if line.startswith("WARNING") else "WARNING: ") + line)
     print(f"\nLoudness: premix {li:.1f} LUFS, gain {gain:+.1f} dB -> target {target} LUFS"
           f"{' (limiter on)' if limiter else ''}")
     print(f"Done: {final}  ({fmt_tc(plan.total)})")
     print(f"Review stills: {review} ({len(times)} JPGs) | captions: {exports / 'captions.srt'} | cuts: {exports / 'edl.csv'}")
+    print(f"Text and image positions: {render_dir / 'layout.json'}. "
+          f"Check them against faces with: python faces.py {project}")
     if args.package:
         print(f"Hand-off package: {exports / 'package'}")
 

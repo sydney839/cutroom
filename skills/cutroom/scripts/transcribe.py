@@ -26,7 +26,7 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from common import CutroomError, die, fmt_tc, inventory, need, project_dir, read_json, run, write_json  # noqa: E402
+from common import CutroomError, die, inventory, need, project_dir, read_json, run, write_json  # noqa: E402
 
 
 def import_whisper():
@@ -83,12 +83,24 @@ def load_model(WhisperModel, name, device):
     return WhisperModel(name, device="cpu", compute_type="int8"), "cpu/int8"
 
 
+def read_wav(wav):
+    """16 kHz mono PCM as float32. Passing samples instead of a path keeps PyAV out of the way
+    (some faster-whisper / PyAV version pairs fail to open files)."""
+    import wave
+    import numpy as np
+    with wave.open(str(wav)) as w:
+        if (w.getframerate(), w.getnchannels(), w.getsampwidth()) != (16000, 1, 2):
+            raise CutroomError(f"{wav} is not 16 kHz mono 16-bit. Delete it and run again to re-extract it.")
+        data = np.frombuffer(w.readframes(w.getnframes()), dtype=np.int16)
+    return data.astype(np.float32) / 32768.0
+
+
 def transcribe_file(model, wav, args, hotwords_ok):
     kw = dict(word_timestamps=True, vad_filter=True, condition_on_previous_text=False,
               language=None if args.language == "auto" else args.language)
     if args.terms:
         kw["hotwords" if hotwords_ok else "initial_prompt"] = args.terms
-    segments, info = model.transcribe(str(wav), **kw)
+    segments, info = model.transcribe(read_wav(wav), **kw)
     words = []
     for seg in segments:
         for w in seg.words or []:
@@ -174,6 +186,10 @@ def main():
     unknown = [i for i in ids if i not in inv]
     if unknown:
         raise CutroomError(f"unknown ID(s) {', '.join(unknown)}. Known IDs: {', '.join(inv)}")
+    photos = [i for i in ids if inv[i]["type"] == "photo"]
+    if photos:
+        raise CutroomError(f"{', '.join(photos)} {'is a photo' if len(photos) == 1 else 'are photos'}: nothing to "
+                           f"transcribe. Pass video or audio IDs.")
     tdir, adir = proj / "work" / "transcripts", proj / "work" / "audio"
     tdir.mkdir(parents=True, exist_ok=True), adir.mkdir(parents=True, exist_ok=True)
     todo = [i for i in ids if args.force or not (tdir / f"{i}.json").exists()]

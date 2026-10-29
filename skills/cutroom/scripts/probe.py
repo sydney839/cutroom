@@ -12,7 +12,7 @@ import argparse
 import csv
 import re
 import sys
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -119,7 +119,8 @@ def probe_file(path: Path) -> dict:
         # HEIC/DNG often cannot be probed by ffprobe; Pillow gives the size
         if row["type"] == "photo" and (ps := photo_size(path)):
             row["width"], row["height"], row["rotation"] = ps
-        row["duration_s"] = round(float(fmt.get("duration", 0) or 0), 2)
+        row["duration_s"] = "" if row["type"] == "photo" else round(float(fmt.get("duration", 0) or 0), 2)
+        row["hdr"] = "no"
         row["codec"] = (a or {}).get("codec_name", "")
         row["has_audio"] = "" if row["type"] == "photo" else ("yes" if a else "no")
     elif v is None:

@@ -1,6 +1,6 @@
 # edit.json reference
 
-`edit.json` lives in the project folder. `render.py` turns it into the video. Paths are relative to the project folder unless absolute. Keys starting with `_` are notes and are ignored, so you can leave yourself comments like `"_why": "stronger take"`.
+`edit.json` lives in the project folder. `render.py`, the reference renderer, turns it into the video; for anything it cannot do, use FFmpeg directly ([recipes.md](recipes.md)). Paths are relative to the project folder unless absolute. Keys starting with `_` are notes and are ignored, so you can leave yourself comments like `"_why": "stronger take"`.
 
 ## Top level
 
@@ -45,7 +45,7 @@ Every clip is one of three kinds.
 | `fade_in`, `fade_out` | Fade from/to black, seconds |
 | `grade` | Per-clip override of the global grade |
 | `captions` | `false` = no captions on this clip |
-| `caption_pos` | `auto` (beside the face, default), `top` (screen recordings: text on a dark box at the top), `bottom`, `center`, or a y value (pixels, or 0..1 of the height) |
+| `caption_pos` | Where this clip's captions go: `default` (y 0.70 vertical, 0.86 landscape), `top` (on a dark box near the top, for screen recordings), `center`, `bottom` (lowest spot inside the safe zone), a y value (0..1 of the height, or pixels) or `[x, y]` for the block center. Decide it from `faces.py` and the stills, see [recipes.md](recipes.md) |
 | `beats` | Make the clip exactly n beats long (needs top-level `beats`) |
 | `note` | Shows up in `exports/edl.csv` |
 
@@ -76,16 +76,29 @@ Duration: `"dur": 1.5`, `"until": <anchor>`, or `"to_end": true`.
 | `enabled` | false = no captions |
 | `style` | `bold` (default for vertical: big uppercase chunks of up to 3 words, pop-in, active word in the accent color), `clean` (default for landscape: sentence case on a translucent box, up to 7 words), `karaoke` (sentence case, active word highlighted), `none` |
 | `max_words`, `size`, `upper`, `highlight`, `pop`, `box`, `outline` | Override parts of the style. `size` as a fraction of the height (0.05) or pixels |
-| `position` | Default position for all clips (`auto`, `top`, `bottom`, `center`) |
+| `position` | Default `caption_pos` for all clips (same values) |
 | `emphasis` | Words always shown in the accent color (substring match) |
 | `fixes` | Replace misheard words (whole words, case-insensitive) |
 | `drop` | Words never shown (fillers). The sound still plays: cut the take so fillers are not spoken |
 
-Placement `auto`: the renderer finds the face in every segment and puts the caption block under the chin if it fits above the platform UI, otherwise above the head, otherwise at 78 % size, otherwise at the bottom with a `FALLBACK` warning. Safe zone for vertical video: y between 14 % and 78 % of the height (platform buttons and captions sit outside).
+Placement: captions go exactly where `caption_pos` says. The renderer does not look for faces; you do, with `faces.py` after a draft render (see [recipes.md](recipes.md)). Safe zone for vertical video: y between 0.14 and 0.78 of the height (platform buttons and captions sit outside); the render warns when captions or overlays reach outside it or cover each other.
 
 ## Overlays
 
 Every overlay has an anchor (`at`) and a duration (`dur`/`until`/`to_end`). Text types take `anim`: `pop`, `fade`, `rise`, `slide`, `typewriter` (only `text` and `chip`), `none`.
+
+**Position:** `"pos": [x, y]` is the center of the block (0..1 of the frame, or pixels; for `lower_third` x is the left edge). Or set only `"y"` (and `"x"`). Without them, each type has a fixed default spot, which is a starting point, not a decision:
+
+| Type | Default y vertical | Default y landscape |
+|---|---|---|
+| `hook` | 0.22 | 0.18 |
+| `chip`, `text` | 0.31 | 0.14 |
+| `title` | 0.50 | 0.50 |
+| `lower_third` | 0.70 (x 0.06) | 0.80 (x 0.06) |
+| `cta` | 0.66 | 0.84 |
+| `image` | `top` 0.30, `center` 0.50, `bottom` 0.62 (landscape 0.70) | |
+
+In vertical talking-head footage the default hook and chip spots (0.22, 0.31) are usually on the face. Run `faces.py` after the first draft and move them into a free band.
 
 | `type` | Keys | Use |
 |---|---|---|
@@ -95,7 +108,7 @@ Every overlay has an anchor (`at`) and a duration (`dur`/`until`/`to_end`). Text
 | `title` | `text`, `sub` | Title or chapter card, centered. Usually on a `card` clip |
 | `lower_third` | `text`, `sub` | Name and role of a speaker, slides in from the left |
 | `cta` | `text`, `handle` | Call to action pill near the end |
-| `image` | `file`, `layout` (`card`: rounded with shadow, default; `full`: fills the frame), `width` (0..1 of the frame width, default 0.8), `pos` (`top`, `center`, `bottom` or `[x, y]`), `rounded` | Screenshots, logos, photos of what you talk about. Crop screenshots wide (2:1 to 4:1) so they stay readable above a face |
+| `image` | `file`, `layout` (`card`: rounded with shadow, default; `full`: fills the frame), `width` (0..1 of the frame width, default 0.8), `pos` (`top`, `center`, `bottom` or `[x, y]`), `y` (overrides the y of `top`/`center`/`bottom`), `rounded` | Screenshots, logos, photos of what you talk about. Crop screenshots wide (2:1 to 4:1) so they fit between chin and captions |
 | `blur` / `pixelate` | `box` `[x, y, w, h]` (0..1 or px), `strength` | Hide private details: QR codes, plates, screens |
 
 ## Music and sound effects
@@ -116,3 +129,5 @@ Every overlay has an anchor (`at`) and a duration (`dur`/`until`/`to_end`). Text
 - `exports/edl.csv` every segment with timeline and source times
 - `exports/package/` with `--package`: `picture_with_dialog.mp4`, `dialog.wav`, `music.wav`, `sfx.wav`, `captions.srt`, `captions.ass`, `markers.csv`, `README.txt`
 - `work/review/*.jpg` stills named by timeline time
+- `work/render/layout.json` every segment and every caption chunk, text and image block with its time and pixel box; `faces.py` reads it
+- `work/render/base.mp4` the cut without text and overlays (what `faces.py` scans)

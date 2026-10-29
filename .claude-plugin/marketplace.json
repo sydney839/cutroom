@@ -1,7 +1,12 @@
 {
   "name": "cutroom",
-  "owner": {"name": "Sydney Rüger", "url": "https://github.com/sydney839"},
-  "metadata": {"description": "cutroom: the video editing skill for Claude Code and other agents."},
+  "owner": {
+    "name": "Sydney Rüger",
+    "url": "https://github.com/sydney839"
+  },
+  "metadata": {
+    "description": "cutroom: the video editing skill for Claude Code and other agents."
+  },
   "plugins": [
     {
       "name": "cutroom",
@@ -9,7 +14,13 @@
       "description": "Plan, cut, caption, animate, mix and self-review real footage with Python and FFmpeg.",
       "version": "0.1.0",
       "license": "MIT",
-      "keywords": ["video", "ffmpeg", "captions", "reels", "vlog"]
+      "keywords": [
+        "video",
+        "ffmpeg",
+        "captions",
+        "reels",
+        "vlog"
+      ]
     }
   ]
 }

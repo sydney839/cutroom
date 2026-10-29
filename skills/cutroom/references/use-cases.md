@@ -1,6 +1,6 @@
 # Use cases
 
-Pick the closest profile, tell the user which one you chose, and adapt it to the brief. The values are starting points, not rules: the brief wins.
+Pick the closest profile, tell the user which one you chose, and adapt it to the brief. The values are starting points, not rules: the brief wins. Where text goes is always your decision after looking at the frames ([recipes.md](recipes.md) has the placement rules); the profiles only say what usually works.
 
 ## 1. Talking-head short (Reels, TikTok, Shorts)
 
@@ -9,8 +9,8 @@ One person speaking to the camera, often several takes.
 - **Format** `reel`, 20 to 60 s (30 to 45 s is the sweet spot for explanations).
 - **Structure** hook (0 to 3 s) -> one sentence of context -> payoff -> loop back or one CTA. Pull the strongest sentence to the front even if it was said last.
 - **Edit** cut on words, `tighten` 0.3 to 0.4, last take of a repeated sentence wins, no filler, no dead air. Alternate `zoom` 1.0 and 1.06 to 1.12 between cuts, 2 to 3 `punch` accents per 30 s on key words.
-- **Captions** `bold`, auto placement beside the face, 2 to 4 `emphasis` words, `fixes` for brand names Whisper gets wrong.
-- **Overlays** a `hook` in the first 2.5 s that says something different from the spoken line (the number or result, while the voice gives the why). 1 to 2 overlays per 10 s at most: `chip` for keywords, `image` cards for what you talk about. A `cta` at the end only if the brief has one.
+- **Captions** `bold`, beside the face: usually below the chin (default y 0.70 when the face sits in the upper half), above the head when the face is low. Confirm with `faces.py` after the first draft. 2 to 4 `emphasis` words, `fixes` for brand names Whisper gets wrong.
+- **Overlays** a `hook` in the first 2.5 s that says something different from the spoken line (the number or result, while the voice gives the why), in the band between chin and captions, never on the face. 1 to 2 overlays per 10 s at most: `chip` for keywords, `image` cards for what you talk about, each in a band the captions don't use at that moment. Small animations (`pop` on chips, a `punch` on the key word) keep it moving. A `cta` at the end only if the brief has one, placed off the mouth and off the captions.
 - **Audio** quiet music bed (vol 0.15 to 0.2) or none, one soft sound per overlay at most.
 - **Check** the first frame works without sound and paused; captions never on the face.
 
@@ -21,7 +21,7 @@ Screen capture, often with a voice-over or a face cam.
 - **Format** `reel` for social clips, `landscape` for full tutorials.
 - **Structure** result first (show the finished thing for 2 s), then the steps in order, each step announced by a `chip` or numbered `text`.
 - **Edit** cut waiting time hard (loading spinners, typing), `speed` 1.5 to 3 for unavoidable waits, `zoom_to` push-ins or `focus` + `zoom` on the part of the screen that matters (text must be readable on a phone).
-- **Captions** `caption_pos: "top"` on screen segments (dark box, readable over UI text), `auto` on face segments.
+- **Captions** `caption_pos: "top"` on screen segments when the action is low on the screen (dark box, readable over UI text), `"bottom"` when it is high; beside the face on face-cam segments.
 - **Privacy** scan every frame for emails, tokens, API keys, customer data, QR codes: `blur` them. Run `qa.py` (it lists QR codes).
 - **Audio** voice-over clean, music very low or none.
 

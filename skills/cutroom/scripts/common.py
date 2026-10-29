@@ -16,14 +16,14 @@ Every script works on one *project folder*:
         takes.md          all speech as timed phrases, the agent reads this (transcribe.py)
         sheets/           contact sheets as JPG, the agent looks at these (sheet.py)
         beats/<name>.json beat grid of a music track (beats.py)
-        render/           cached segments and stems (render.py)
+        render/           cached segments, stems, base.mp4 and layout.json of the last render (render.py)
+        faces.json        face boxes and free bands per segment (faces.py)
         review/           stills of the last render (render.py, qa.py)
       exports/            final video, captions.srt, stems/, qa.md
 
 Originals are never modified, moved or deleted.
 """
 import json
-import os
 import shutil
 import subprocess
 import sys
